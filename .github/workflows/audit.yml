@@ -1,0 +1,346 @@
+name: Phase-4 Code Audit (happy)
+
+# PHASE-4 SCANNING WORKFLOW (personal code-review-tool trial) — planning repo
+# PLAN-009. Self-checkout on a dedicated `audit` branch cut from the pinned
+# commit eb980a5c9eea25b1c145c06cd6241a0a365c2b6d so the fork's push-CI and its main/pin HEAD are never touched.
+# The application tree on this branch is byte-identical to the pin (only
+# .github/** was added), and .github/** is excluded from application-only
+# scoring, so every count is "at the pin".
+#
+# Stack: Semgrep, CodeQL, Snyk Code, OSV, Trivy, pnpm audit, gitleaks, jscpd, knip, dependency-cruiser. DAST is N/A for this target (recorded in the scorecard, not
+# forced). SARIF -> Security tab + run artifacts (compared offline with jq).
+
+on:
+  push:
+    branches: [ audit ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: phase4-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  semgrep:
+    name: SAST - Semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: { contents: read, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        continue-on-error: true
+        run: |
+          docker run --rm --user 0 -v "${PWD}:/src" -w /src semgrep/semgrep \
+            semgrep scan \
+              --config p/default --config p/security-audit --config p/secrets \
+              --config p/owasp-top-ten --config p/typescript --config p/react --config p/nodejs \
+              --exclude docs --exclude assets --exclude patches --exclude environments \
+              --metrics off --sarif --output /src/semgrep.sarif
+      - name: Record manifest
+        if: always()
+        run: |
+          { echo "## semgrep"; echo "packs: p/default p/security-audit p/secrets p/owasp-top-ten p/typescript p/react p/nodejs"; echo "scanned HEAD: $(git rev-parse HEAD)"; } > manifest-semgrep.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: manifest-semgrep, path: manifest-semgrep.txt, if-no-files-found: warn }
+      - name: Upload Semgrep SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: semgrep.sarif, category: semgrep }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sarif-semgrep, path: semgrep.sarif, if-no-files-found: warn }
+  codeql:
+    name: SAST - CodeQL (javascript-typescript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions: { contents: read, security-events: write, actions: read }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        id: codeql-init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - name: CodeQL analyze
+        continue-on-error: true
+        uses: github/codeql-action/analyze@v3
+        with: { category: codeql, output: codeql-results, upload: always }
+      - name: Collect CodeQL SARIF
+        if: always()
+        run: |
+          cp codeql-results/*.sarif codeql.sarif 2>/dev/null || echo "::warning::CodeQL produced no SARIF"
+          [ -s codeql.sarif ] && echo "codeql results: $(jq '[.runs[].results[]?]|length' codeql.sarif)" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sarif-codeql, path: codeql.sarif, if-no-files-found: warn }
+  snyk-code:
+    name: SAST - Snyk Code
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: { contents: read, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snyk/actions/setup@master
+      - name: Snyk Code test
+        continue-on-error: true
+        env: { SNYK_TOKEN: '${{ secrets.SNYK_TOKEN }}' }
+        run: |
+          echo "SNYK_TOKEN length: ${#SNYK_TOKEN}"
+          snyk code test --sarif-file-output=snyk-code.sarif || true
+      - name: Upload Snyk Code SARIF to Security tab
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: snyk-code.sarif, category: snyk-code }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sarif-snyk-code, path: snyk-code.sarif, if-no-files-found: warn }
+  osv-scanner:
+    name: SCA - OSV-Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: { contents: read, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv.sarif
+            ./
+      - name: Upload OSV SARIF to Security tab
+        if: always() && hashFiles('osv.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: osv.sarif, category: osv-scanner }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sarif-osv-scanner, path: osv.sarif, if-no-files-found: warn }
+  trivy:
+    name: SCA + secrets + misconfig - Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: { contents: read, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan (SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with: { scan-type: fs, scan-ref: ., scanners: 'vuln,secret,misconfig', format: sarif, output: trivy.sarif }
+      - name: Trivy filesystem scan (JSON)
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with: { scan-type: fs, scan-ref: ., scanners: 'vuln,secret,misconfig', format: json, output: trivy.json }
+      - name: Upload Trivy SARIF to Security tab
+        if: always() && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: trivy.sarif, category: trivy }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-trivy
+          path: |
+            trivy.sarif
+            trivy.json
+          if-no-files-found: warn
+  gitleaks:
+    name: Secrets - gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: { contents: read, security-events: write }
+    env: { GITLEAKS_VERSION: 8.30.1 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o "$asset" "${base}/${asset}"
+          curl -sSfL -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${asset}\$" checksums.txt > expected.txt
+          sha256sum -c expected.txt
+          tar -xzf "$asset" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          mkdir -p "${RUNNER_TEMP}/gl"
+          echo "REPORT_DIR=${RUNNER_TEMP}/gl" >> "$GITHUB_ENV"
+      - name: gitleaks scan (working tree)
+        run: |
+          gitleaks dir . --report-format sarif --report-path "$REPORT_DIR/gitleaks.sarif" --exit-code 0 --no-banner
+          gitleaks dir . --report-format json --report-path "$REPORT_DIR/gitleaks.json" --exit-code 0 --no-banner
+          echo "gitleaks findings: $(jq 'length' "$REPORT_DIR/gitleaks.json" 2>/dev/null || echo '?')"
+      - name: Collect reports
+        if: always()
+        run: |
+          mkdir -p gl && cp "$REPORT_DIR"/* gl/ 2>/dev/null || true
+      - name: Upload gitleaks SARIF to Security tab
+        if: always() && hashFiles('gl/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: gl/gitleaks.sarif, category: gitleaks }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sarif-gitleaks, path: gl/, if-no-files-found: warn }
+  ecosystem-audit:
+    name: SCA baseline - pnpm audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9 --activate
+          pnpm --version
+      - name: pnpm audit (JSON)
+        continue-on-error: true
+        run: |
+          pnpm audit --json > pnpm-audit.json 2>pnpm-audit-err.txt || true
+          pnpm audit > pnpm-audit.txt 2>&1 || true
+          head -c 400 pnpm-audit.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ecosystem-audit
+          path: |
+            pnpm-audit.json
+            pnpm-audit.txt
+            pnpm-audit-err.txt
+          if-no-files-found: warn
+  jscpd:
+    name: Design - jscpd (duplication)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: jscpd scan
+        continue-on-error: true
+        run: |
+          npx --yes jscpd@4 . \
+            --pattern "packages/**/*.{ts,tsx}" \
+            --ignore "**/node_modules/**,**/.github/**,**/public/**,**/assets/**,**/dist/**,**/.next/**,**/*.lock,**/pnpm-lock.yaml,**/package-lock.json" \
+            --reporters json,markdown,console --output jscpd-report --mode mild || true
+          ls -la jscpd-report || true
+      - name: Summarise jscpd
+        if: always()
+        run: |
+          f=jscpd-report/jscpd-report.json
+          [ -s "$f" ] && echo "jscpd sources=$(jq -r '.statistics.total.sources//0' $f) clones=$(jq -r '(.duplicates|length)//0' $f) dupLines=$(jq -r '.statistics.total.duplicatedLines//0' $f)" || echo "no jscpd report"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: maintainability-jscpd, path: jscpd-report/, if-no-files-found: warn }
+  knip:
+    name: Design - knip (dead code / unused deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Write knip config
+        run: |
+          cat > "$RUNNER_TEMP/knip.json" <<'KNIPEOF'
+          {
+            "$schema": "https://unpkg.com/knip@5/schema.json",
+            "ignore": [
+              "node_modules/**",
+              ".github/**",
+              ".next/**",
+              "dist/**",
+              "public/**"
+            ]
+          }
+          KNIPEOF
+          echo "--- knip config ---"; cat "$RUNNER_TEMP/knip.json"
+      - name: knip scan
+        continue-on-error: true
+        run: |
+          npx --yes knip@5 --config "$RUNNER_TEMP/knip.json" --reporter json --no-exit-code > knip-report.json 2> knip-stderr.txt || true
+          echo "--- stderr ---"; tail -30 knip-stderr.txt || true
+          echo "--- report head ---"; head -c 1500 knip-report.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: maintainability-knip
+          path: |
+            knip-report.json
+            knip-stderr.txt
+          if-no-files-found: warn
+  dependency-cruiser:
+    name: Design - dependency-cruiser (module graph)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Write depcruise config
+        run: |
+          cat > "$RUNNER_TEMP/dc.cjs" <<'DCEOF'
+          module.exports = {
+            forbidden: [
+              { name: 'no-circular', severity: 'warn', from: {}, to: { circular: true } },
+              { name: 'no-orphans', severity: 'info', from: { orphan: true, pathNot: '[.]d[.]ts$' }, to: {} },
+            ],
+            options: { doNotFollow: { path: 'node_modules' }, tsConfig: { fileName: 'tsconfig.json' }, exclude: '(node_modules|[.]github|public|dist|[.]next)' }
+          };
+          DCEOF
+      - name: dependency-cruiser scan
+        continue-on-error: true
+        run: |
+          npx --yes --package dependency-cruiser@16 --package typescript@5 -- \
+            depcruise packages --config "$RUNNER_TEMP/dc.cjs" --output-type json > depcruise.json 2> dc-err.txt || true
+          npx --yes --package dependency-cruiser@16 --package typescript@5 -- \
+            depcruise packages --config "$RUNNER_TEMP/dc.cjs" --output-type err-long > dc-violations.txt 2>&1 || true
+          echo "modules: $(jq -r '(.modules|length)//0' depcruise.json 2>/dev/null || echo '?')"
+          tail -20 dc-err.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: maintainability-dependency-cruiser
+          path: |
+            depcruise.json
+            dc-violations.txt
+            dc-err.txt
+          if-no-files-found: warn
+  summary:
+    name: Findings summary
+    runs-on: ubuntu-latest
+    needs: [ semgrep, codeql, snyk-code, osv-scanner, trivy, gitleaks, ecosystem-audit, jscpd, knip, dependency-cruiser ]
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Download all SARIF artifacts
+        uses: actions/download-artifact@v4
+        with: { pattern: sarif-*, path: sarif, merge-multiple: true }
+      - name: Count findings per SARIF
+        run: |
+          {
+            echo "## Phase-4 audit summary (happy)"
+            echo "Scanned repo: \`${GITHUB_REPOSITORY}\`  ref \`${GITHUB_SHA}\`"
+            echo ""
+            echo "| SARIF file | results |"
+            echo "|---|---|"
+            shopt -s nullglob
+            for f in sarif/*.sarif; do
+              n=$(jq '[.runs[].results[]?]|length' "$f" 2>/dev/null || echo "parse error")
+              echo "| $(basename "$f") | ${n} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Re-upload combined SARIF bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: sarif-all, path: sarif/, if-no-files-found: warn }
+
+# rev2: re-run with SNYK_TOKEN present
